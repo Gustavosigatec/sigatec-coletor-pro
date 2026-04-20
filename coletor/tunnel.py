@@ -29,14 +29,31 @@ import json
 import ssl
 import threading
 import time
+import urllib.request
 from datetime import datetime
 from typing import Optional
-from urllib.request import Request as _Request, urlopen as _urlopen
+from urllib.request import Request as _Request
 from urllib.error import URLError as _URLError
 
 _SSL_NO_VERIFY = ssl.create_default_context()
 _SSL_NO_VERIFY.check_hostname = False
 _SSL_NO_VERIFY.verify_mode = ssl.CERT_NONE
+
+
+class _SemRedirect(urllib.request.HTTPErrorProcessor):
+    """Impede que urllib siga redirects automaticamente.
+    O servidor é responsável por tratar redirecionamentos HTTP→HTTPS."""
+    def http_response(self, request, response):
+        return response
+    https_response = http_response
+
+
+# Openers reutilizáveis (sem redirect, com/sem SSL)
+_OPENER_HTTP = urllib.request.build_opener(_SemRedirect())
+_OPENER_HTTPS = urllib.request.build_opener(
+    _SemRedirect(),
+    urllib.request.HTTPSHandler(context=_SSL_NO_VERIFY),
+)
 
 from coletor import config
 from coletor.utils import get_logger, get_installation_id, carregar_config
@@ -65,8 +82,8 @@ def _fazer_request_impressora(ip: str, path: str, method: str,
                                req_headers: dict, https: bool = False) -> dict:
     """Faz uma requisição HTTP/HTTPS para o painel web da impressora.
 
-    Retorna dict com status, headers, body (base64), content_type.
-    Quando https=True, usa HTTPS e ignora erros de certificado autoassinado.
+    Não segue redirects — o servidor decide se deve re-emitir via HTTPS.
+    Retorna dict com status, headers (lowercase), body (base64), content_type.
     """
     # Normaliza path
     path = path.lstrip("/") if path else ""
@@ -85,14 +102,16 @@ def _fazer_request_impressora(ip: str, path: str, method: str,
     # Força host correto
     safe_headers["Host"] = ip
 
+    opener = _OPENER_HTTPS if https else _OPENER_HTTP
+
     try:
         req = _Request(url, method=method.upper(), headers=safe_headers)
-        ssl_ctx = _SSL_NO_VERIFY if https else None
-        with _urlopen(req, timeout=10, context=ssl_ctx) as resp:
+        with opener.open(req, timeout=10) as resp:
             status = resp.status
-            resp_headers = dict(resp.headers)
+            # Retorna headers em lowercase para o servidor detectar Location etc.
+            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
             body = resp.read()
-            content_type = resp_headers.get("Content-Type", resp_headers.get("content-type", ""))
+            content_type = resp_headers.get("content-type", "")
     except _URLError as e:
         log.debug("Proxy HTTP erro %s%s: %s", ip, path, e)
         return {
@@ -112,7 +131,7 @@ def _fazer_request_impressora(ip: str, path: str, method: str,
 
     return {
         "status": status,
-        "headers": {},
+        "headers": resp_headers,
         "body": base64.b64encode(body).decode(),
         "content_type": content_type,
     }
