@@ -79,7 +79,8 @@ def _set_status(status: str) -> None:
 
 
 def _fazer_request_impressora(ip: str, path: str, method: str,
-                               req_headers: dict, https: bool = False) -> dict:
+                               req_headers: dict, https: bool = False,
+                               body_b64: str = "") -> dict:
     """Faz uma requisição HTTP/HTTPS para o painel web da impressora.
 
     Não segue redirects — o servidor decide se deve re-emitir via HTTPS.
@@ -89,6 +90,14 @@ def _fazer_request_impressora(ip: str, path: str, method: str,
     path = path.lstrip("/") if path else ""
     scheme = "https" if https else "http"
     url = f"{scheme}://{ip}/{path}"
+
+    # Decodifica body do POST (se houver)
+    req_body: bytes | None = None
+    if body_b64:
+        try:
+            req_body = base64.b64decode(body_b64)
+        except Exception:
+            req_body = None
 
     # Cabeçalhos seguros para repassar (exclui hop-by-hop e Connection)
     _EXCLUIR_HEADERS = {
@@ -105,7 +114,7 @@ def _fazer_request_impressora(ip: str, path: str, method: str,
     opener = _OPENER_HTTPS if https else _OPENER_HTTP
 
     try:
-        req = _Request(url, method=method.upper(), headers=safe_headers)
+        req = _Request(url, data=req_body, method=method.upper(), headers=safe_headers)
         with opener.open(req, timeout=10) as resp:
             status = resp.status
             # Retorna headers em lowercase para o servidor detectar Location etc.
@@ -305,19 +314,21 @@ class TunnelClient:
         method = msg.get("method", "GET")
         headers = msg.get("headers", {}) or {}
         https = bool(msg.get("https", False))
+        body_b64 = msg.get("body", "")
 
         log.debug("Proxy request: %s %s://%s%s", method, "https" if https else "http", ip, path)
 
         # Executa em thread pra não bloquear o loop principal
         threading.Thread(
             target=self._executar_proxy,
-            args=(ws, req_id, ip, path, method, headers, https),
+            args=(ws, req_id, ip, path, method, headers, https, body_b64),
             daemon=True,
         ).start()
 
     def _executar_proxy(self, ws, req_id: str, ip: str, path: str,
-                        method: str, headers: dict, https: bool = False) -> None:
-        resultado = _fazer_request_impressora(ip, path, method, headers, https)
+                        method: str, headers: dict, https: bool = False,
+                        body_b64: str = "") -> None:
+        resultado = _fazer_request_impressora(ip, path, method, headers, https, body_b64)
         resposta = {
             "type": "proxy_response",
             "id": req_id,
