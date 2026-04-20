@@ -1,0 +1,11 @@
+requests>=2.31.0
+# puresnmp 1.x: sync API, sem sistema de plugins (compatível com PyInstaller).
+# 2.x tem plugin discovery via entry_points que quebra no .exe.
+puresnmp==1.11.0
+pystray>=0.19.5
+Pillow>=10.0.0
+python-dotenv>=1.0.0
+pywin32>=306 ; sys_platform == "win32"
+# websockets: cliente WebSocket para o tunnel de acesso remoto
+# >= 12 usa websockets.sync.client; versão anterior é suportada via fallback
+websockets>=11.0
