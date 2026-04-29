@@ -3,6 +3,7 @@ Cliente HTTP que envia as leituras ao Sigatec.
 
 Adaptado para usar o endpoint /api/bc/ingest existente no Brother Counter.
 """
+from __future__ import annotations
 import json
 from typing import List
 from datetime import datetime
@@ -18,6 +19,15 @@ log = get_logger()
 
 def _headers_padrao() -> dict:
     """Headers comuns a todas as requisições pro Sigatec."""
+    # DEBUG temporario: loga primeiros/ultimos chars da chave + tamanho.
+    # Sem isso nao tem como saber se o exe esta enviando placeholder vazio,
+    # chave correta, ou chave embaralhada. NAO loga a chave inteira.
+    _k = config.INGEST_KEY or ""
+    if _k:
+        log.info("DEBUG_KEY: len=%d, primeiros=%r, ultimos=%r",
+                 len(_k), _k[:6], _k[-6:])
+    else:
+        log.warning("DEBUG_KEY: INGEST_KEY VAZIA! placeholder nao foi substituido no build.")
     return {
         "X-API-Key": config.INGEST_KEY,
         "X-Installation-ID": get_installation_id(),

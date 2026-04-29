@@ -35,7 +35,7 @@ python --version
 echo ============================================================
 echo.
 
-python installer\build.py --ingest-key "%INGEST_KEY%" --suffix Win7 --clean
+py -3.8 installer\build.py --ingest-key "%INGEST_KEY%" --suffix Win7 --clean
 
 if errorlevel 1 (
     echo.

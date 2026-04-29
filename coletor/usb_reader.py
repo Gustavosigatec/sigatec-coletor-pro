@@ -130,12 +130,28 @@ def ler_via_usb_direto() -> List[LeituraImpressora]:
         info_inst = usb_bidi.info_da_instance_id(inst_id)
 
         # Se PJL não devolveu serial, tenta pegar do descriptor USB via PowerShell
+        # (Win 8.1+) ou Registry (Win 7 fallback)
         serial = (dados.get("serial") or "").upper()
         if not serial:
             serial_usb = usb_bidi.obter_serial_usb_via_pnp(inst_id)
             if serial_usb:
                 serial = serial_usb.upper()
                 log.info("Serial obtido do USB descriptor (fallback): %s", serial)
+
+        # Ultimo fallback: extrai do modelo_raw o codigo entre os dois ':'
+        # Brother T-series e algumas DCP retornam: 'Brother MODELO:CODIGO:Versao'
+        # onde CODIGO eh um identificador de fabrica (nao garantidamente unico, mas
+        # pelo menos permite identificacao). Melhor que descartar a leitura.
+        if not serial:
+            modelo_raw = dados.get("modelo_raw") or ""
+            partes = modelo_raw.split(":")
+            if len(partes) >= 2:
+                cand = partes[1].strip()
+                # Aceita se parecer um codigo (alfanumerico + hifens, 4+ chars)
+                import re as _re_local
+                if cand and _re_local.match(r'^[A-Z0-9\-]{4,}$', cand, _re_local.IGNORECASE):
+                    serial = cand.upper()
+                    log.info("Serial fallback do modelo_raw '%s' -> %s", modelo_raw, serial)
 
         leitura = LeituraImpressora(
             ip="usb",

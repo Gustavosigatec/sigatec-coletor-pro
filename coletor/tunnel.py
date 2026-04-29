@@ -1,29 +1,24 @@
 """
 Módulo de túnel WebSocket reverso.
-
 Mantém uma conexão persistente com o servidor central e permite que o
 servidor faça requisições HTTP para o painel web das impressoras através
 do agente — sem precisar abrir portas no cliente.
-
 Fluxo:
   Servidor → WS → Agente → HTTP → Impressora → HTTP → Agente → WS → Servidor
-
 Protocolo (JSON sobre WebSocket):
   Entrada (servidor → agente):
     {"type": "proxy_request", "id": "req-xxx", "ip": "192.168.1.50",
      "path": "/", "method": "GET", "headers": {}, "https": false}
-
   Saída (agente → servidor):
     {"type": "proxy_response", "id": "req-xxx", "status": 200,
-     "headers": {}, "body": "<base64>", "content_type": "text/html"}
-
+     "headers": {}, "body": "<base64>", "content_type": "text/html",
+     "set_cookies": ["SessionId=xxx; Path=/", "SessKey=yyy; Path=/"]}
   Heartbeat (agente → servidor):
     {"type": "heartbeat", "installation_id": "...", "timestamp": "..."}
-
   Lista de impressoras (agente → servidor):
     {"type": "printer_list", "installation_id": "...", "printers": [...]}
 """
-
+from __future__ import annotations
 import base64
 import json
 import ssl
@@ -38,6 +33,18 @@ from urllib.error import URLError as _URLError
 _SSL_NO_VERIFY = ssl.create_default_context()
 _SSL_NO_VERIFY.check_hostname = False
 _SSL_NO_VERIFY.verify_mode = ssl.CERT_NONE
+# Permite cifras legadas usadas por firmwares Brother antigos
+# (RC4, DH < 2048, SHA-1). Sem isso, Python/OpenSSL rejeita o handshake
+# com SSLV3_ALERT_HANDSHAKE_FAILURE ao tentar HTTPS na impressora.
+try:
+    _SSL_NO_VERIFY.set_ciphers("DEFAULT@SECLEVEL=0")
+except ssl.SSLError:
+    pass
+# Permite TLS 1.0 e 1.1 (desabilitados por padrão no Python 3.10+)
+try:
+    _SSL_NO_VERIFY.minimum_version = ssl.TLSVersion.TLSv1
+except AttributeError:
+    pass
 
 
 class _SemRedirect(urllib.request.HTTPErrorProcessor):
@@ -77,14 +84,13 @@ def _set_status(status: str) -> None:
         _status_tunnel = status
 
 
-
 def _fazer_request_impressora(ip: str, path: str, method: str,
                                req_headers: dict, https: bool = False,
                                body_b64: str = "") -> dict:
     """Faz uma requisição HTTP/HTTPS para o painel web da impressora.
-
     Não segue redirects — o servidor decide se deve re-emitir via HTTPS.
-    Retorna dict com status, headers (lowercase), body (base64), content_type.
+    Retorna dict com status, headers (lowercase), body (base64), content_type
+    e set_cookies (lista com todos os Set-Cookie retornados pela impressora).
     """
     # Normaliza path
     path = path.lstrip("/") if path else ""
@@ -112,13 +118,25 @@ def _fazer_request_impressora(ip: str, path: str, method: str,
     safe_headers["Host"] = ip
 
     opener = _OPENER_HTTPS if https else _OPENER_HTTP
-
+    # POST/PUT podem demorar mais (impressora salva configs e pode reiniciar)
+    _http_timeout = 50 if method.upper() in ("POST", "PUT", "PATCH") else 10
     try:
         req = _Request(url, data=req_body, method=method.upper(), headers=safe_headers)
-        with opener.open(req, timeout=10) as resp:
+        with opener.open(req, timeout=_http_timeout) as resp:
             status = resp.status
-            # Retorna headers em lowercase para o servidor detectar Location etc.
-            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+            # Coleta TODOS os headers, preservando duplicatas de Set-Cookie
+            # resp.headers é um email.message.Message — items() retorna todos os pares
+            resp_headers: dict[str, str] = {}
+            set_cookies: list[str] = []
+            for k, v in resp.headers.items():
+                key_lower = k.lower()
+                if key_lower == "set-cookie":
+                    set_cookies.append(v)
+                else:
+                    resp_headers[key_lower] = v
+            # Mantém o último set-cookie no dict de headers para compatibilidade
+            if set_cookies:
+                resp_headers["set-cookie"] = set_cookies[-1]
             body = resp.read()
             content_type = resp_headers.get("content-type", "")
     except _URLError as e:
@@ -128,6 +146,7 @@ def _fazer_request_impressora(ip: str, path: str, method: str,
             "headers": {},
             "body": base64.b64encode(str(e).encode()).decode(),
             "content_type": "text/plain",
+            "set_cookies": [],
         }
     except Exception as e:
         log.debug("Proxy HTTP erro inesperado %s%s: %s", ip, path, e)
@@ -136,6 +155,7 @@ def _fazer_request_impressora(ip: str, path: str, method: str,
             "headers": {},
             "body": base64.b64encode(str(e).encode()).decode(),
             "content_type": "text/plain",
+            "set_cookies": [],
         }
 
     return {
@@ -143,15 +163,28 @@ def _fazer_request_impressora(ip: str, path: str, method: str,
         "headers": resp_headers,
         "body": base64.b64encode(body).decode(),
         "content_type": content_type,
+        "set_cookies": set_cookies,
     }
 
 
 def _obter_impressoras_conhecidas() -> list:
-    """Retorna a lista de impressoras conhecidas (IPs descobertos via SNMP)."""
+    """Retorna a lista de impressoras conhecidas incluindo modelo/serial se disponíveis.
+    O modelo/serial é salvo em config['impressoras_info'] após cada coleta SNMP.
+    """
     try:
         cfg = carregar_config()
         ips = cfg.get("ips_conhecidos") or []
-        return [{"ip": ip} for ip in ips]
+        impressoras_info = cfg.get("impressoras_info") or {}
+        result = []
+        for ip in ips:
+            info = impressoras_info.get(ip) or {}
+            printer: dict = {"ip": ip}
+            if info.get("modelo"):
+                printer["modelo"] = info["modelo"]
+            if info.get("serial"):
+                printer["serial"] = info["serial"]
+            result.append(printer)
+        return result
     except Exception:
         return []
 
@@ -201,7 +234,6 @@ class TunnelClient:
                 backoff = min(backoff * 2, config.TUNNEL_BACKOFF_MAX)
             else:
                 backoff = config.TUNNEL_BACKOFF_MIN
-
         _set_status("desconectado")
         log.info("Loop de reconexão encerrado")
 
@@ -226,13 +258,13 @@ class TunnelClient:
             "X-API-Key": config.INGEST_KEY,
             "X-Installation-ID": installation_id,
         }
-
         log.info("Conectando ao tunnel WS: %s", config.TUNNEL_WS_URL)
-
+        # NOTA: websockets.sync.client.connect() (>=12) NAO aceita ping_interval
+        # nem ping_timeout — esses parametros existem apenas na API async/legacy.
+        # Heartbeat e feito manualmente abaixo via thread TunnelHeartbeat.
         with _wsc.connect(
             config.TUNNEL_WS_URL,
             additional_headers=extra_headers,
-            ping_interval=None,      # Heartbeat manual
             open_timeout=15,
             close_timeout=5,
         ) as ws:
@@ -254,7 +286,6 @@ class TunnelClient:
                 name="TunnelHeartbeat",
             )
             hb_thread.start()
-
             try:
                 self._loop_mensagens(ws, installation_id)
             finally:
@@ -281,7 +312,6 @@ class TunnelClient:
                 continue
 
             tipo = msg.get("type")
-
             if tipo == "proxy_request":
                 self._handle_proxy_request(ws, msg)
             elif tipo == "ping":
@@ -315,7 +345,6 @@ class TunnelClient:
         headers = msg.get("headers", {}) or {}
         https = bool(msg.get("https", False))
         body_b64 = msg.get("body", "")
-
         log.debug("Proxy request: %s %s://%s%s", method, "https" if https else "http", ip, path)
 
         # Executa em thread pra não bloquear o loop principal
@@ -354,10 +383,13 @@ class TunnelClient:
         log.info("Tunnel: enviada lista com %d impressora(s)", len(impressoras))
 
     def _checar_lista_impressoras(self, ws, installation_id: str) -> None:
-        """Envia lista atualizada se as impressoras mudaram desde o último envio."""
+        """Envia lista atualizada se as impressoras ou o nome do agente mudaram."""
         try:
             atual = _obter_impressoras_conhecidas()
-            if atual != self._ultima_lista_impressoras:
+            nome_atual = carregar_config().get("nome_agente", "")
+            nome_anterior = getattr(self, "_ultimo_nome_agente", None)
+            if atual != self._ultima_lista_impressoras or nome_atual != nome_anterior:
+                self._ultimo_nome_agente = nome_atual
                 self._enviar_lista_impressoras(ws, installation_id)
         except Exception:
             pass

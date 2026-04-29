@@ -508,6 +508,9 @@ def obter_serial_usb_via_pnp(instance_id: str) -> Optional[str]:
                                                     ^^^^^^^^^ serial
 
     Se o pai tiver um ID sintetizado pelo Windows (começa com dígito&), retorna None.
+
+    Fallback: se PowerShell falhar (Win 7 com PS 2.0 nao tem Get-PnpDeviceProperty),
+    usa registry diretamente.
     """
     import subprocess
     import re as _re
@@ -515,7 +518,7 @@ def obter_serial_usb_via_pnp(instance_id: str) -> Optional[str]:
     if os.name != "nt" or not instance_id:
         return None
 
-    # Pede o DEVPKEY_Device_Parent do dispositivo
+    # ── Tentativa 1: PowerShell Get-PnpDeviceProperty (Win 8.1+/Win 10+) ─────
     cmd_ps = (
         f"(Get-PnpDeviceProperty -InstanceId '{instance_id}' "
         f"-KeyName 'DEVPKEY_Device_Parent').Data"
@@ -527,28 +530,80 @@ def obter_serial_usb_via_pnp(instance_id: str) -> Optional[str]:
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         parent_id = (out.stdout or "").strip()
+        stderr_text = (out.stderr or "").strip()
         log.debug("Parent device do %s: %s", instance_id, parent_id)
 
-        # parent_id exemplo: "USB\VID_04F9&PID_0719\E12345678"
-        m = _re.search(
-            r'USB\\VID_[0-9A-F]{4}&PID_[0-9A-F]{4}\\([^\s\\]+)',
-            parent_id, _re.IGNORECASE
-        )
-        if not m:
-            return None
-        candidato = m.group(1).strip()
-
-        # Filtra IDs que o Windows sintetiza quando a impressora NÃO tem iSerial
-        # real no descriptor. Formato sintetizado: começa com dígito seguido de &
-        # Ex: "6&13D1568C&1&0" — Windows-gerado
-        if _re.match(r'^\d+&', candidato):
-            log.debug("Parent ID sintetizado por Windows (sem iSerial real): %s", candidato)
-            return None
-
-        # Tem cara de serial de verdade (só hex/alfanum, sem &)
-        return candidato.upper()
+        # Se PowerShell nao reconhecer o cmdlet (Win 7 PS 2.0), parent_id vem vazio
+        # ou stderr tem "CommandNotFoundException" — cai no fallback
+        if parent_id and "CommandNotFoundException" not in stderr_text:
+            m = _re.search(
+                r'USB\\VID_[0-9A-F]{4}&PID_[0-9A-F]{4}\\([^\s\\]+)',
+                parent_id, _re.IGNORECASE
+            )
+            if m:
+                candidato = m.group(1).strip()
+                if _re.match(r'^\d+&', candidato):
+                    log.debug("Parent ID sintetizado por Windows (sem iSerial real): %s", candidato)
+                else:
+                    return candidato.upper()
     except Exception as e:
-        log.debug("Erro consultando parent do USB: %s", e)
+        log.debug("Erro consultando parent do USB via PowerShell: %s", e)
+
+    # ── Tentativa 2: Registry direto (compativel com Win 7 SP1+) ─────────────
+    return _obter_serial_usb_via_registry(instance_id)
+
+
+def _obter_serial_usb_via_registry(instance_id: str) -> Optional[str]:
+    """Le o serial USB diretamente do registry do Windows.
+
+    Path: HKLM\\SYSTEM\\CurrentControlSet\\Enum\\USB\\VID_xxxx&PID_xxxx\\<SERIAL>
+
+    Os subkeys diretos de VID_xxxx&PID_xxxx sao OS SERIAIS REAIS dos dispositivos
+    (ou IDs sintetizados pelo Windows quando o firmware nao tem iSerialNumber).
+
+    Estrategia:
+      1. Extrai VID e PID do instance_id (ex: USB\\VID_04F9&PID_0719&MI_00\\...)
+      2. Abre HKLM\\...Enum\\USB\\VID_xxxx&PID_xxxx (sem &MI_xx — chave do device pai)
+      3. Enumera subkeys e retorna o primeiro que NAO seja sintetizado.
+    """
+    import re as _re
+
+    if os.name != "nt" or not instance_id:
+        return None
+
+    try:
+        import winreg  # noqa: F401  (so existe no Windows)
+    except ImportError:
+        return None
+
+    # Extrai VID e PID do instance_id
+    m = _re.search(r'VID_([0-9A-F]{4})&PID_([0-9A-F]{4})', instance_id, _re.IGNORECASE)
+    if not m:
+        return None
+    vid, pid = m.group(1).upper(), m.group(2).upper()
+
+    chave_pai = rf"SYSTEM\CurrentControlSet\Enum\USB\VID_{vid}&PID_{pid}"
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, chave_pai) as k:
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(k, i)
+                except OSError:
+                    break
+                i += 1
+                # Filtra IDs sintetizados pelo Windows (digit& = sem iSerial real)
+                if _re.match(r'^\d+&', sub):
+                    log.debug("Subkey USB sintetizado (ignorado): %s", sub)
+                    continue
+                # Tem cara de serial real
+                log.info("Serial obtido do registry USB (Win 7 fallback): %s", sub)
+                return sub.upper()
+    except FileNotFoundError:
+        log.debug("Chave de registry nao encontrada: %s", chave_pai)
+    except OSError as e:
+        log.debug("Erro lendo registry USB: %s", e)
     return None
 
 

@@ -57,13 +57,36 @@ def _arquivar_versoes_anteriores():
         exe.rename(target)
 
 
-def _nome_versionado(base: str, suffix: str | None) -> str:
+def _nome_versionado(base, suffix):
     """Monta nome do .exe com data: base[_suffix]_YYYY-MM-DD"""
     partes = [base]
     if suffix:
         partes.append(suffix)
     partes.append(datetime.now().strftime("%Y-%m-%d"))
     return "_".join(partes)
+
+
+def _coletar_ucrt_dlls():
+    """Coleta DLLs da Universal C Runtime + Visual C++ Runtime para bundlar
+    no exe. Sem isso, o .exe nao roda em Win 7 sem o update KB2999226 nem
+    em Win 10 antigos sem o KB3118401 / VC++ Redist 2015."""
+    system32 = Path(os.environ.get("SYSTEMROOT", "C:\\Windows")) / "System32"
+    if not system32.exists():
+        return []
+    padroes = [
+        "api-ms-win-core-*.dll",
+        "api-ms-win-crt-*.dll",
+        "ucrtbase.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+        "msvcp140.dll",
+        "concrt140.dll",
+    ]
+    dlls = []
+    for p in padroes:
+        for d in system32.glob(p):
+            dlls.append(str(d))
+    return dlls
 
 
 def main():
@@ -132,6 +155,26 @@ def main():
 
     CONFIG_PY.write_text(novo, encoding="utf-8")
 
+    # CRITICO: Limpa o __pycache__/config.cpython-3X.pyc que foi gerado
+    # automaticamente quando importamos _xor_encode de coletor.config no
+    # inicio do script. Aquele .pyc foi compilado a partir do config.py
+    # COM PLACEHOLDER. Se nao apagarmos, o PyInstaller pode incluir o .pyc
+    # antigo no exe e a chave embutida vai ficar como placeholder vazio
+    # -> servidor rejeita com "API Key invalida".
+    pycache_dir = ROOT / "coletor" / "__pycache__"
+    if pycache_dir.exists():
+        print(f"Limpando {pycache_dir} para forcar PyInstaller a usar config.py atualizado...")
+        shutil.rmtree(pycache_dir)
+
+    # Coleta DLLs da UCRT e VC++ Runtime do System32 para embutir no exe.
+    # Garante que o .exe roda em Win 7 SP1, Win 10 e Win 11 sem precisar
+    # de updates do Windows nem de Visual C++ Redistributable instalado.
+    ucrt_dlls = _coletar_ucrt_dlls()
+    print(f"\nUCRT/VC++ DLLs a embutir: {len(ucrt_dlls)} arquivos.")
+    if not ucrt_dlls:
+        print("AVISO: Nenhuma DLL UCRT encontrada em System32. O exe pode "
+              "nao rodar em Win 7. Continuando sem embutir DLLs...")
+
     try:
         print("Rodando PyInstaller...")
         cmd = [
@@ -142,6 +185,11 @@ def main():
             "--name", nome_exe,
             "--additional-hooks-dir", str(ROOT / "installer" / "hooks"),
             "--runtime-hook", str(ROOT / "installer" / "hooks" / "rthook_puresnmp.py"),
+        ]
+        # Embute UCRT/VC++ Runtime DLLs (compatibilidade Win 7 / Win 10 antigo)
+        for dll in ucrt_dlls:
+            cmd.extend(["--add-binary", f"{dll};."])
+        cmd.extend([
 
             # ── websockets ────────────────────────────────────────────────────
             # Importa submódulos em runtime; collect-all garante que todos
@@ -212,7 +260,7 @@ def main():
             "--hidden-import", "email.mime.multipart",
 
             "main.py",
-        ]
+        ])
         env = dict(os.environ)
         env.pop("SIGATEC_INGEST_KEY", None)
         env.pop("SIGATEC_API_KEY", None)
